@@ -112,6 +112,16 @@ class CriterionRevision:
 
 
 @dataclass(frozen=True)
+class CriterionSummary:
+    criterion_id: int
+    revision: int
+    statement: str
+    reason: str | None
+    status: str
+    updated_at: datetime
+
+
+@dataclass(frozen=True)
 class CriterionEvent:
     revision: int
     action: str
@@ -119,6 +129,13 @@ class CriterionEvent:
     occurred_at: datetime
     statement: str
     reason: str | None
+
+
+@dataclass(frozen=True)
+class CriterionDetail:
+    criterion: CriterionRevision
+    messages: list[ConversationMessage]
+    history: list[CriterionEvent]
 
 
 class CriterionStateError(ValueError):
@@ -167,25 +184,41 @@ class KnowledgeStore:
         if source is not None and source not in MESSAGE_SOURCES:
             raise ValueError(f"Unknown message source: {source}")
         with open_database(self._db_path) as db:
-            rows = db.execute("""
-                SELECT message.*, COALESCE(provenance.source, 'graph') AS source,
-                       provenance.source_ref
-                FROM teams_chat_messages AS message
-                LEFT JOIN conversation_message_sources AS provenance USING (chat_id, message_id)
-                WHERE instr(message.body, ?) > 0
-                  AND (? IS NULL OR message.chat_id = ?)
-                  AND (
-                      ? IS NULL
-                      OR (? = 'graph' AND provenance.source IS NULL)
-                      OR EXISTS (
-                          SELECT 1 FROM conversation_message_sources AS matching
-                          WHERE matching.chat_id = message.chat_id
-                            AND matching.message_id = message.message_id
-                            AND matching.source = ?
-                      )
-                  )
-                ORDER BY message.sent_at DESC, message.chat_id, message.message_id, provenance.source
-            """, (text, chat_id, chat_id, source, source, source)).fetchall()
+            return self._read_messages(db, """
+                instr(message.body, ?) > 0
+                AND (? IS NULL OR message.chat_id = ?)
+                AND (
+                    ? IS NULL
+                    OR (? = 'graph' AND provenance.source IS NULL)
+                    OR EXISTS (
+                        SELECT 1 FROM conversation_message_sources AS matching
+                        WHERE matching.chat_id = message.chat_id
+                          AND matching.message_id = message.message_id
+                          AND matching.source = ?
+                    )
+                )
+            """, (text, chat_id, chat_id, source, source, source))
+
+    def _get_messages(self, db, keys: Iterable[MessageKey]) -> list[ConversationMessage]:
+        keys = tuple(keys)
+        if not keys:
+            return []
+        placeholders = ", ".join("(?, ?)" for _ in keys)
+        return self._read_messages(
+            db,
+            f"(message.chat_id, message.message_id) IN (VALUES {placeholders})",
+            tuple(value for key in keys for value in key),
+        )
+
+    def _read_messages(self, db, condition, parameters):
+        rows = db.execute(f"""
+            SELECT message.*, COALESCE(provenance.source, 'graph') AS source,
+                   provenance.source_ref
+            FROM teams_chat_messages AS message
+            LEFT JOIN conversation_message_sources AS provenance USING (chat_id, message_id)
+            WHERE {condition}
+            ORDER BY message.sent_at DESC, message.chat_id, message.message_id, provenance.source
+        """, parameters)
         messages = []
         for (conversation_id, message_id), group in groupby(
             rows, key=lambda row: (row["chat_id"], row["message_id"]),
@@ -223,6 +256,41 @@ class KnowledgeStore:
             """, (kind, kind, subject_ref, subject_ref))
             return [KnowledgeEntry(*row) for row in rows]
 
+    def get_knowledge(self, entry_id: int) -> KnowledgeEntry:
+        with open_database(self._db_path) as db:
+            row = db.execute("""
+                SELECT id, kind, title, body, subject_ref FROM knowledge_entries WHERE id = ?
+            """, (entry_id,)).fetchone()
+        if row is None:
+            raise KeyError(entry_id)
+        return KnowledgeEntry(*row)
+
+    def list_criteria(self, *, status: str | None = None) -> list[CriterionSummary]:
+        """Load current review states and their most recent activity timestamps."""
+        with open_database(self._db_path) as db:
+            rows = db.execute("""
+                SELECT revision.criterion_id, revision.revision, revision.statement, revision.reason,
+                       revision.status, (
+                           SELECT history.occurred_at FROM criterion_history AS history
+                           WHERE history.criterion_id = revision.criterion_id
+                             AND history.revision = revision.revision
+                           ORDER BY history.id DESC LIMIT 1
+                       ) AS updated_at
+                FROM criterion_revisions AS revision
+                WHERE revision.revision = (
+                    SELECT MAX(latest.revision) FROM criterion_revisions AS latest
+                    WHERE latest.criterion_id = revision.criterion_id
+                ) AND (? IS NULL OR revision.status = ?)
+                ORDER BY updated_at DESC, revision.criterion_id DESC
+            """, (status, status))
+            return [
+                CriterionSummary(
+                    row["criterion_id"], row["revision"], row["statement"], row["reason"],
+                    row["status"], datetime.fromisoformat(row["updated_at"]),
+                )
+                for row in rows
+            ]
+
     def submit_criterion(
         self, *, statement: str, reason: str | None = None, evidence: Iterable[MessageKey] = (),
         actor: str = "ai",
@@ -258,6 +326,16 @@ class KnowledgeStore:
         with open_database(self._db_path) as db:
             return self._get_criterion(db, criterion_id, revision)
 
+    def get_criterion_detail(self, criterion_id: int) -> CriterionDetail:
+        """Load the review state, evidence, and history from one database snapshot."""
+        with open_database(self._db_path) as db, db:
+            db.execute("BEGIN")
+            criterion = self._get_criterion(db, criterion_id)
+            return CriterionDetail(
+                criterion, self._get_messages(db, criterion.evidence),
+                self._criterion_history(db, criterion_id),
+            )
+
     def approved_criteria(self) -> list[CriterionRevision]:
         """Return the latest approved revision per criterion for use by the AI."""
         with open_database(self._db_path) as db:
@@ -272,19 +350,22 @@ class KnowledgeStore:
 
     def criterion_history(self, criterion_id: int) -> list[CriterionEvent]:
         with open_database(self._db_path) as db:
-            rows = db.execute("""
-                SELECT history.revision, history.action, history.actor, history.occurred_at,
-                       revision.statement, revision.reason
-                FROM criterion_history AS history
-                JOIN criterion_revisions AS revision USING (criterion_id, revision)
-                WHERE history.criterion_id = ?
-                ORDER BY history.id
-            """, (criterion_id,))
-            return [
-                CriterionEvent(row["revision"], row["action"], row["actor"],
-                               datetime.fromisoformat(row["occurred_at"]), row["statement"], row["reason"])
-                for row in rows
-            ]
+            return self._criterion_history(db, criterion_id)
+
+    def _criterion_history(self, db, criterion_id):
+        rows = db.execute("""
+            SELECT history.revision, history.action, history.actor, history.occurred_at,
+                   revision.statement, revision.reason
+            FROM criterion_history AS history
+            JOIN criterion_revisions AS revision USING (criterion_id, revision)
+            WHERE history.criterion_id = ?
+            ORDER BY history.id
+        """, (criterion_id,))
+        return [
+            CriterionEvent(row["revision"], row["action"], row["actor"],
+                           datetime.fromisoformat(row["occurred_at"]), row["statement"], row["reason"])
+            for row in rows
+        ]
 
     def _add_revision(self, db, criterion_id, revision, statement, reason, evidence, actor, action):
         _require_text(statement, "statement")

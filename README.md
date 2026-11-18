@@ -96,3 +96,23 @@ official = store.approved_criteria()
 - `criterion_history()` では登録・修正・承認・却下の操作、担当者、日時を確認できます。`get_criterion(..., revision=版番号)` で過去の本文、理由、根拠メッセージ、承認日時を参照できます。
 
 SQLite固有の処理は `knowledge_db.py` と `conversation_storage.py` の永続化層にまとめています。クラウドDBへ移行する際は、呼び出し側が使うメソッドとデータ型を維持しながら永続化層を差し替えられます。Purviewエクスポートの解析は後続Issueの対象です。
+
+## ナレッジ管理Web画面
+
+Python 3.11以上で、ダミーデータを使って管理画面を起動できます。
+
+```sh
+python3 -m knowledge_admin --demo
+```
+
+ブラウザで [ローカル管理画面](http://127.0.0.1:8080/) を開いてください。ダッシュボードから判断基準の確認・修正・承認・却下や、業務知識の閲覧ができます。デモの変更は一時SQLiteファイルに保存され、サーバーの終了時に破棄されます。
+
+既存の開発用SQLiteを使う場合は `--db ./data/teams-chat.sqlite3` を指定します。ポートの変更には `--port` を使います。サーバーは常に `127.0.0.1` で待ち受ける認証未実装のローカル用です。接続元のホスト名と、指定された場合はOriginを確認します。
+
+画面は同一オリジンのJSON APIを使用します。APIは `KnowledgeStore` を通じて変更を保存し、古い版へのレビューを拒否します。AI向けデータは引き続き `KnowledgeStore.approved_criteria()` から取得します。将来のMicrosoft 365 SSO連携では、`AdminServer` の `reviewer_for_request` に認証と権限確認を行う処理を接続し、認証済みの利用者IDをレビュー履歴に渡します。
+
+```sh
+python3 -m unittest discover -s tests -v
+```
+
+Webのテストはローカルの一時ポートと一時SQLiteを使います。
