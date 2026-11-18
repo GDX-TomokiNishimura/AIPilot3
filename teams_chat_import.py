@@ -2,7 +2,6 @@
 
 import argparse
 import calendar
-from contextlib import closing
 from datetime import UTC, datetime
 from html.parser import HTMLParser
 from http.client import HTTPException
@@ -17,28 +16,11 @@ from urllib.parse import quote, unquote, urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 from uuid import UUID
 
+from conversation_storage import CONVERSATION_SCHEMA, open_database, store_message, utc_timestamp
+
 
 GRAPH_ORIGIN = "https://graph.microsoft.com"
 LOGGER = logging.getLogger(__name__)
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS teams_chat_messages (
-    chat_id TEXT NOT NULL,
-    message_id TEXT NOT NULL,
-    sender_id TEXT NOT NULL,
-    sender_display_name TEXT,
-    sent_at TEXT NOT NULL,
-    body TEXT NOT NULL,
-    PRIMARY KEY (chat_id, message_id)
-)
-"""
-
-INSERT_MESSAGE = """
-INSERT INTO teams_chat_messages
-    (chat_id, message_id, sender_id, sender_display_name, sent_at, body)
-VALUES (?, ?, ?, ?, ?, ?)
-ON CONFLICT (chat_id, message_id) DO NOTHING
-"""
 
 
 class ImportFailure(Exception):
@@ -177,7 +159,7 @@ def message_row(message, chat_id, sent_at):
     if not isinstance(message_id, str) or not message_id:
         raise ImportFailure("Graph text message has no message ID")
     return (chat_id, message_id, sender["id"], sender.get("displayName"),
-            sent_at.isoformat(timespec="microseconds"), content)
+            utc_timestamp(sent_at), content)
 
 
 def validate_page_url(url, messages_path):
@@ -211,15 +193,8 @@ def import_chat(client, chat_id, db_path, *, now=None):
     url = f"{GRAPH_ORIGIN}{messages_path}?{query}"
     seen_urls = set()
     inserted = 0
-    try:
-        descriptor = os.open(db_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError:
-        pass
-    else:
-        os.close(descriptor)
-
-    with closing(sqlite3.connect(db_path)) as db:
-        db.execute(SCHEMA)
+    with open_database(db_path) as db:
+        db.executescript(CONVERSATION_SCHEMA)
         while url is not None:
             if not isinstance(url, str):
                 raise ImportFailure("Graph returned an invalid pagination link")
@@ -243,9 +218,13 @@ def import_chat(client, chat_id, db_path, *, now=None):
                 if cutoff <= sent_at <= now:
                     row = message_row(message, chat_id, sent_at)
                     if row is not None:
-                        rows.append(row)
+                        source_ref = message.get("webUrl")
+                        if not isinstance(source_ref, str) or not source_ref:
+                            source_ref = None
+                        rows.append((row, source_ref))
             with db:
-                inserted += db.executemany(INSERT_MESSAGE, rows).rowcount
+                for row, source_ref in rows:
+                    inserted += store_message(db, row, "graph", source_ref)
             # Graph returns newest first by createdDateTime across pages.
             url = None if reached_cutoff else page.get("@odata.nextLink")
     return inserted

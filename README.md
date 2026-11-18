@@ -49,3 +49,50 @@ python3 -m unittest discover -s tests -v
 ```
 
 モックのEntra・Graphレスポンスと一時SQLite DBで検証します。実際のTeamsデータや認証情報は不要です。
+
+## ナレッジ管理DB
+
+`knowledge_db.KnowledgeStore` は会話、業務知識、判断基準を扱うバックエンド用のPython APIです。既存のGraphバッチと同じSQLiteファイルを指定できます。初回に必要なテーブルを追加し、既存の `teams_chat_messages` の行をそのまま読み込みます。
+
+```python
+from datetime import UTC, datetime
+
+from knowledge_db import KnowledgeStore
+
+store = KnowledgeStore("./data/teams-chat.sqlite3")
+store.register_message(
+    chat_id="dummy-chat",
+    message_id="message-1",
+    sender_id="dummy-mentor",
+    sent_at=datetime(2026, 8, 10, 6, 30, tzinfo=UTC),
+    body="発注前に在庫数を確認してください。",
+    source="manual",
+    source_ref="dummy-notes:1",
+)
+matches = store.search_messages("在庫", chat_id="dummy-chat")
+candidate = store.submit_criterion(
+    statement="発注前に在庫を確認する",
+    reason="重複発注を防ぐため",
+    evidence=[(message.chat_id, message.message_id) for message in matches],
+)
+store.approve_criterion(
+    candidate.criterion_id, expected_revision=candidate.revision, actor="dummy-reviewer",
+)
+official = store.approved_criteria()
+```
+
+### 会話とナレッジ
+
+- `register_message()` は整形済みのメッセージを登録します。取得元は `graph`、`purview`、`manual` のいずれかで、`source_ref` には元データのURLやレコード識別子を指定できます。Graphバッチはレスポンスに `webUrl` がある場合に保存します。出典の記録がない既存行は `graph` として扱います。
+- 会話IDとメッセージIDが両方一致する場合は、登録済みの本文を保持したまま出典を追加できます。各出典には最初の空でない参照を保持します。将来のPurview取り込みでは、Graphと同じメッセージを共通のIDに対応付ける必要があります。
+- `search_messages()` は本文の部分一致で検索し、会話IDと取得元で絞り込めます。
+- `add_knowledge()` と `list_knowledge()` で、業務知識（`business_knowledge`）、業務ルール（`business_rule`）、プロジェクト情報（`project`）、指導内容（`employee_guidance`）、習熟度（`employee_proficiency`）を扱えます。対象の社員やプロジェクトは `subject_ref` で識別できます。
+
+### 判断基準のレビュー
+
+- `submit_criterion()` は判断基準、理由、根拠となる会話IDとメッセージIDを保存します。理由が空なら確認待ち（`awaiting_reason`）、理由があれば承認待ち（`pending`）になります。
+- `revise_criterion()` は新しい版を追加します。レビュー担当者は `approve_criterion()` または `reject_criterion()` で対象の版を処理します。承認には理由が必要です。呼び出し元がレビュー担当者の権限を確認し、本人の識別子を `actor` に渡します。
+- AIが正式な判断根拠を取得する場合は `approved_criteria()` を使います。判断基準ごとに最新の承認済み版を取得します。候補の登録、修正、却下で、過去に承認された版が自動的に置き換わることはありません。
+- `criterion_history()` では登録・修正・承認・却下の操作、担当者、日時を確認できます。`get_criterion(..., revision=版番号)` で過去の本文、理由、根拠メッセージ、承認日時を参照できます。
+
+SQLite固有の処理は `knowledge_db.py` と `conversation_storage.py` の永続化層にまとめています。クラウドDBへ移行する際は、呼び出し側が使うメソッドとデータ型を維持しながら永続化層を差し替えられます。Purviewエクスポートの解析は後続Issueの対象です。
